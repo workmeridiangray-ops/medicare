@@ -1,6 +1,7 @@
 """MedCompare API with isolated provider failures and conservative matching."""
 import logging
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,6 +34,21 @@ def _price(r) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+def _relevance(query: str, text: str) -> tuple[int, float]:
+    # Plain character-similarity (SequenceMatcher) rates a short query against
+    # a short-but-wrong title (e.g. "Dolo" vs "Dologel", 7 chars) higher than
+    # against the right one (e.g. "Dolo 650 Tablet", 16 chars) purely because
+    # it's shorter overall - a string-length artifact, not a real match.
+    # Verified live: searching bare "Dolo" picked "Dologel" as the reference.
+    # Primary key instead: how many whole query words appear as whole words
+    # in the title ("dolo" must be its own word, not a substring of
+    # "dologel"), so a real token match always outranks a shorter near-miss.
+    # Similarity stays as the tiebreaker among equally-relevant titles.
+    query_words = re.findall(r'[a-z0-9]+', query.lower())
+    title_words = set(re.findall(r'[a-z0-9]+', text.lower()))
+    overlap = sum(1 for w in query_words if w in title_words)
+    return (overlap, similarity(query, text))
+
 def run_compare(query: str) -> dict:
     sources = {
         '1mg': lambda: scrape_1mg.search(query),
@@ -51,7 +67,7 @@ def run_compare(query: str) -> dict:
                 errors[name] = 'Provider temporarily unavailable; prices could not be checked.'
     # Fall back to another available provider rather than requiring 1mg.
     candidates = next((rows for rows in listings.values() if rows), [])
-    reference_result = max(candidates, key=lambda r: similarity(query, full_text(r)), default=None)
+    reference_result = max(candidates, key=lambda r: _relevance(query, full_text(r)), default=None)
     reference = parse_listing_title(full_text(reference_result)) if reference_result else None
     if reference and match_score(reference, reference) < .80:
         # A title missing its unit/pack cannot anchor a confirmed comparison.
@@ -66,7 +82,7 @@ def run_compare(query: str) -> dict:
                             for (lv, lu), (rv, ru) in zip(_strength_key(reference.strength) or [],
                                                         _strength_key(parsed.strength) or []))]
         if complete:
-            reference_result = max(complete, key=lambda r: similarity(query, full_text(r)))
+            reference_result = max(complete, key=lambda r: _relevance(query, full_text(r)))
             reference = parse_listing_title(full_text(reference_result))
     platforms, available = {}, []
     for name, rows in listings.items():
