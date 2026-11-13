@@ -1,252 +1,113 @@
-"""
-Medicine-name normalization and cross-platform matching.
-
-The hard problem: "Dolo 650 Tablet 15's" (1mg), "Dolo 650mg Strip of 15 Tablets"
-(PharmEasy), "DOLO 650 TAB 15S" (Netmeds) all need to resolve to the SAME
-canonical_items row. Pure string similarity fails because pack-size and brand
-vs. generic naming vary. This module breaks the title into structured fields
-first, then matches on those fields — string similarity is only a tie-breaker.
-
-Usage:
-    from normalize.match import parse_listing_title, find_or_create_canonical
-
-    parsed = parse_listing_title("Dolo 650mg Strip of 15 Tablets")
-    # -> ParsedMedicine(brand='Dolo', strength='650mg', pack_size='15', form='tablet')
-"""
-
+"""Conservative title matching: incomplete identities never confirm equivalence."""
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from difflib import SequenceMatcher
 from typing import Optional
-
-# Common pack-size phrasing across platforms: "15's", "strip of 15", "15 tab", "x15"
-PACK_SIZE_PATTERNS = [
-    r"(\d+)\s*(?:'s|s\b)",
-    r"strip of\s*(\d+)",
-    r"pack of\s*(\d+)",
-    r"x\s*(\d+)\b",
-    r"(\d+)\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules)\b",
-]
-
-STRENGTH_PATTERN = r"(\d+(?:\.\d+)?)\s*(mg|mcg|ml|gm|g|%|iu)\b"
-
-FORM_WORDS = {
-    "tablet": ["tablet", "tab", "tabs"],
-    "capsule": ["capsule", "cap", "caps"],
-    "syrup": ["syrup", "suspension"],
-    "injection": ["injection", "inj"],
-    "cream": ["cream", "ointment", "gel"],
-    "drops": ["drops", "drop"],
-    "sachet": ["sachet", "sachets"],
-}
-
 
 @dataclass
 class ParsedMedicine:
     raw_title: str
-    brand_or_molecule: str   # best-effort: leading words before strength/pack info
-    strength: Optional[str]  # e.g. "650mg"
-    pack_size: Optional[str] # e.g. "15"
-    form: Optional[str]      # e.g. "tablet"
+    brand_or_molecule: str
+    strength: Optional[str]
+    pack_size: Optional[str]
+    form: Optional[str]
 
+FORM_WORDS = {
+    'tablet': r'\b(?:tablets?|tabs?)\b',
+    'capsule': r'\b(?:capsules?|caps?)\b',
+    'syrup': r'\bsyrup\b',
+    'suspension': r'\bsuspension\b',
+    'injection': r'\b(?:injections?|inj)\b',
+    'cream': r'\bcream\b',
+    'ointment': r'\bointment\b',
+    'gel': r'\bgel\b',
+    'drops': r'\bdrops?\b',
+    'sachet': r'\bsachets?\b',
+}
+STRENGTH = re.compile(r'(\d+(?:\.\d+)?)\s*(mcg|mg|gm|g|iu|%)(?![a-z])', re.I)
+PACK = [r"(\d+)\s*['’]?s\b", r'(?:strip|pack)\s+of\s+(\d+)',
+        r'\bx\s*(\d+)\b', r'(\d+)\s*(?:tablets?|tabs?|capsules?|caps?|sachets?)(?:\(s\))?\b']
 
 def parse_listing_title(title: str) -> ParsedMedicine:
-    t = title.strip()
-    lower = t.lower()
-
-    strength = None
-    strength_match = re.search(STRENGTH_PATTERN, lower)
-    if strength_match:
-        strength = f"{strength_match.group(1)}{strength_match.group(2)}"
-
-    # Mask out the strength's digits before hunting for pack size — handles
-    # titles where the strength DOES carry a unit (e.g. "650mg").
-    pack_search_text = lower
-    if strength_match:
-        start, end = strength_match.span()
-        pack_search_text = lower[:start] + " " * (end - start) + lower[end:]
-
-    # Take the LAST match for a pattern, not the first. Real titles put the
-    # strength number right after the brand name, near the START of the
-    # string ("Dolo 650 Tablet ..."), and the pack count near the END
-    # ("... strip of 15 tablets"). The generic "<digit> tablet(s)" pattern
-    # can match BOTH "650 Tablet" and "15 tablets" in the same string even
-    # with strength masked out as a bare number (no unit) — e.g. "Dolo 650
-    # Tablet 15 tablets" has no unit on "650" to mask. Taking the rightmost
-    # match favors the real pack count over the strength number. Verified
-    # against live 1mg data: without this, "Dolo 650 Tablet" + "15 tablets"
-    # parsed pack_size as '650' instead of '15'.
+    lower = title.lower().strip()
+    form = next((f for f, pattern in FORM_WORDS.items() if re.search(pattern, lower)), None)
+    # Every explicit strength is retained, including combination ingredients.
+    strengths = list(STRENGTH.finditer(lower))
+    strength = '|'.join(m.group(1) + m.group(2) for m in strengths) or None
+    masked = STRENGTH.sub(lambda m: ' ' * len(m.group()), lower)
     pack_size = None
-    for pat in PACK_SIZE_PATTERNS:
-        matches = list(re.finditer(pat, pack_search_text))
+    pack_start = len(lower)
+    for pattern in PACK:
+        matches = list(re.finditer(pattern, masked))
         if matches:
-            pack_size = matches[-1].group(1)
+            match = matches[-1]
+            # A leading strength such as Dolo 650 Tablet is not a pack count.
+            if pattern == PACK[-1] and not strengths and len(re.findall(r'\d+', masked)) == 1:
+                continue
+            pack_size, pack_start = match.group(1), match.start()
             break
-
-    # Guard: if the title has only ONE number total (no explicit pack
-    # phrase like "strip of", "'s", "pack of" — just a bare generic
-    # "<digit> tablet" match), that lone number is far more likely to be
-    # the STRENGTH written without its unit (e.g. "Dolo 650 Tablet" with no
-    # "mg") than a pack count, since real pack counts almost always show up
-    # as a SECOND number later in the title ("strip of 15", "15's").
-    # Verified against live 1mg data: "Dolo 650 Tablet" alone (no pack info
-    # in that field) was parsing pack_size='650' — i.e. treating the drug
-    # strength as if it were a 650-tablet pack, which would make this
-    # medicine fail to match its own correct listing on other platforms
-    # whenever the pack count wasn't bundled into the same string.
-    all_numbers = re.findall(r"\d+", pack_search_text)
-    has_explicit_pack_phrase = any(
-        re.search(p, pack_search_text) for p in PACK_SIZE_PATTERNS[:4]  # all but the generic "<digit> tablet" one
-    )
-    if pack_size and len(all_numbers) <= 1 and not has_explicit_pack_phrase:
-        pack_size = None
-
-    # Fallback: if no unit-based strength was found, but the FIRST number in
-    # the title (immediately after the brand, e.g. "Dolo 650 Tablet") isn't
-    # being claimed as the pack size, treat it as a bare strength value with
-    # no unit. This number is dropped otherwise — and a dropped strength
-    # means two genuinely different-strength products (e.g. "Dolo 650" vs
-    # "Dolo 500") can't be told apart, since the comparison has nothing to
-    # check. Verified against live Netmeds data: without this, "Dolo 500mg
-    # Tablet 15'S" falsely matched a "Dolo 650 Tablet" reference — a real
-    # wrong-strength mismatch a medicine site cannot afford to get wrong.
-    # Stored WITHOUT a unit (just digits) — match_score compares strength by
-    # numeric value only, so a bare "650" still correctly matches "650mg".
-    if strength is None and all_numbers:
-        first_number = all_numbers[0]
-        if first_number != pack_size:
-            strength = first_number
-
-    form = None
-    for form_name, words in FORM_WORDS.items():
-        if any(w in lower for w in words):
-            form = form_name
-            break
-
-    # Brand/molecule = everything before the first digit, stripped of punctuation.
-    # This is intentionally crude — it's the seed for fuzzy matching, not the final word.
-    m = re.search(r"^[^\d]+", t)
-    brand_or_molecule = (m.group(0) if m else t).strip(" -,:").strip()
-
-    return ParsedMedicine(
-        raw_title=t,
-        brand_or_molecule=brand_or_molecule,
-        strength=strength,
-        pack_size=pack_size,
-        form=form,
-    )
-
+    # Liquid/topical volume is pack information, never a dosage strength.
+    volume = re.search(r'\b(\d+(?:\.\d+)?)\s*ml\b', lower)
+    if volume:
+        pack_size = volume.group(1) + 'ml'
+        pack_start = min(pack_start, volume.start())
+    if not strength:
+        bare = re.search(r'\d+(?:\.\d+)?', lower[:pack_start])
+        if bare:
+            strength = bare.group()
+    # Keep suffixes (SR, Plus, etc.) and exact brand identity. Strip only known
+    # form/pack/strength syntax; similarity must never erase a variant name.
+    brand = lower[:pack_start]
+    brand = STRENGTH.sub(' ', brand)
+    brand = re.sub(r'(?<![a-z0-9])\d+(?:\.\d+)?(?![a-z0-9])', ' ', brand)
+    for pattern in FORM_WORDS.values():
+        brand = re.sub(pattern, ' ', brand)
+    brand = re.sub(r'\(s\)', ' ', brand)
+    brand = re.sub(r'[^a-z0-9]+', '', brand)
+    # Concentrations cannot safely be inferred by this title-only matcher.
+    if re.search(r'/\s*(?:\d+(?:\.\d+)?\s*)?(?:ml|g|gm)\b', lower):
+        strength = None
+    return ParsedMedicine(title.strip(), brand, strength, pack_size, form)
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-
-def _normalize_brand(s: str) -> str:
-    """Lowercase, strip punctuation/whitespace, so 'Dolo-650' and 'dolo 650'
-    normalize the same — but 'Dolo' and 'Dolomed' stay different."""
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
+def _strength_key(value):
+    keys = []
+    for component in value.split('|'):
+        m = re.fullmatch(r'(\d+(?:\.\d+)?)(mcg|mg|gm|g|iu|%)?', component)
+        if not m:
+            return None
+        number, unit = Decimal(m[1]), m[2]
+        # Preserve units: 10mg and 10mcg must never compare equal.
+        if unit in ('g', 'gm'):
+            number, unit = number * 1000, 'mg'
+        elif unit == 'mcg':
+            number, unit = number / 1000, 'mg'
+        keys.append((number, unit))
+    return keys
 
 def match_score(a: ParsedMedicine, b: ParsedMedicine) -> float:
-    """
-    Weighted score 0..1, with a HARD GATE on brand/molecule name.
-
-    Why a gate and not just a fuzzy weight: on real Indian pharmacy data,
-    dozens of distinct brands share a prefix (Dolo, Dolomed, Dolopar, Dolosen,
-    Doloxer, Dolofirst, ... are all different real products, not variants of
-    one brand). Plain string-similarity scoring rates "Dolo" vs "Dolomed"
-    HIGHER than "Dolo" vs "Dolo" with messier formatting, because the fuzzy
-    ratio rewards shared substrings regardless of whether they're the same
-    product — verified against 18 live 1mg results where this produced 5
-    false "same medicine" matches. For a medicine site, a false match here
-    means telling someone the wrong drug is their cheaper option, so this
-    gate errs toward rejecting rather than guessing.
-
-    The gate: normalized brand strings must be exactly equal, OR one must be
-    a true prefix/suffix of the other with a length difference of at most 2
-    chars (catches "Dolo650" vs "Dolo-650" style formatting noise only — not
-    "Dolo" vs "Dolomed", a 4-char difference).
-    """
-    norm_a = _normalize_brand(a.brand_or_molecule)
-    norm_b = _normalize_brand(b.brand_or_molecule)
-
-    brand_gate_passed = False
-    if norm_a and norm_b:
-        if norm_a == norm_b:
-            brand_gate_passed = True
-        elif (norm_a in norm_b or norm_b in norm_a) and abs(len(norm_a) - len(norm_b)) <= 2:
-            brand_gate_passed = True
-
-    if not brand_gate_passed:
+    if not a.brand_or_molecule or a.brand_or_molecule != b.brand_or_molecule:
         return 0.0
-
-    score = 0.0
-    weight_total = 0.0
-
-    # Strength: must match if both present, else neutral. Compared on
-    # digits only — a bare fallback value like "650" (no unit, see
-    # parse_listing_title) must still match a unit-bearing "650mg" from
-    # another platform, while correctly differing from "500mg".
-    if a.strength and b.strength:
-        weight_total += 0.40
-        digits_a = re.sub(r"[^0-9.]", "", a.strength)
-        digits_b = re.sub(r"[^0-9.]", "", b.strength)
-        if digits_a and digits_a == digits_b:
-            score += 0.40
-
-    # Pack size: must match if both present
-    if a.pack_size and b.pack_size:
-        weight_total += 0.30
-        if a.pack_size == b.pack_size:
-            score += 0.30
-
-    # Form: tablet vs syrup etc. — hard mismatch if both present and differ
-    if a.form and b.form:
-        weight_total += 0.15
-        if a.form == b.form:
-            score += 0.15
-
-    # Brand already passed the hard gate — small residual weight for exactness
-    weight_total += 0.15
-    score += 0.15 * similarity(a.brand_or_molecule, b.brand_or_molecule)
-
-    if weight_total == 0:
+    if not a.form or a.form != b.form or not a.pack_size or a.pack_size != b.pack_size:
         return 0.0
-    return score / weight_total
+    if not a.strength or not b.strength:
+        return 0.0
+    left, right = _strength_key(a.strength), _strength_key(b.strength)
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    for (lv, lu), (rv, ru) in zip(left, right):
+        if lv != rv or lu != ru:
+            return 0.0
+    # A bare number cannot confirm a dosage unit, even against another bare number.
+    return 1.0 if all(unit is not None for _, unit in left) else 0.0
 
-
-def best_canonical_match(parsed: ParsedMedicine, candidates: list[dict], threshold: float = 0.80):
-    """
-    candidates: list of {"id": int, "canonical_name": str} pulled from
-    canonical_items for the same item_type (cheap pre-filter, e.g. by trigram
-    search on canonical_name, should happen in SQL before this is called).
-
-    Returns (canonical_item_id, confidence) or (None, 0.0) if nothing clears
-    the threshold — in which case the caller should insert a new
-    canonical_items row and flag match_status='manual' for a human to confirm
-    on the first few runs.
-    """
+def best_canonical_match(parsed, candidates: list[dict], threshold: float = 0.80):
     best_id, best_score = None, 0.0
-    for c in candidates:
-        c_parsed = parse_listing_title(c["canonical_name"])
-        s = match_score(parsed, c_parsed)
-        if s > best_score:
-            best_id, best_score = c["id"], s
-
-    if best_score >= threshold:
-        return best_id, best_score
-    return None, best_score
-
-
-if __name__ == "__main__":
-    titles = [
-        "Dolo 650 Tablet 15's",
-        "Dolo 650mg Strip of 15 Tablets",
-        "DOLO 650 TAB 15S",
-        "Crocin Advance Tablet 15's",  # should NOT match Dolo
-    ]
-    parsed = [parse_listing_title(t) for t in titles]
-    for p in parsed:
-        print(p)
-    print("Dolo variants similarity:", match_score(parsed[0], parsed[1]))
-    print("Dolo vs Crocin similarity:", match_score(parsed[0], parsed[3]))
+    for candidate in candidates:
+        score = match_score(parsed, parse_listing_title(candidate['canonical_name']))
+        if score > best_score:
+            best_id, best_score = candidate['id'], score
+    return (best_id, best_score) if best_score >= threshold else (None, best_score)

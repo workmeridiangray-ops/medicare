@@ -60,7 +60,7 @@ class RawListing:
 def _parse_rupees(text: Optional[str]) -> Optional[float]:
     if not text:
         return None
-    m = re.search(r"[\d,]+\.?\d*", text.replace("₹", ""))
+    m = re.search(r"[\d,]+\.?\d*", str(text).replace("₹", ""))
     return float(m.group(0).replace(",", "")) if m else None
 
 

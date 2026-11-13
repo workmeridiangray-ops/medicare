@@ -35,3 +35,28 @@ Then open http://localhost:8000.
 Deployed on Render as a Python web service:
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+
+## Validation
+
+```sh
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+Provider searches run concurrently; an unavailable provider is reported separately
+and does not hide results from working providers. Only positive, finite prices
+for in-stock matched listings can win the lowest listed price. Search results
+are cached for 180 seconds with a bounded cache; partial outages are not cached.
+
+Matching is deliberately conservative: exact brand/variant, known dosage form,
+pack size and unit-aware strength are required. Missing units or unsupported
+concentrations remain unconfirmed in “Other results”. Title matching is not
+clinical verification and cannot identify therapeutic substitutes. A complete
+listing may anchor the comparison when the first provider lacks identity fields;
+the selected reference is always shown.
+
+These are undocumented website endpoints, not contracted data feeds. Availability
+can change. Prices are indicative: 1mg defaults to Pune; this app does not verify
+user-local stock or include delivery fees, personalised discounts or checkout
+charges. Confirm every listing with the pharmacy. The UI shows the retrieval
+time and links to the original listing.

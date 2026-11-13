@@ -62,7 +62,7 @@
     <h1>Live medicine price comparison</h1>
     <p>Across 1mg, PharmEasy &amp; Netmeds — for your own reference, not a pharmacy.</p>
     <div class="searchbar">
-      <input id="searchInput" type="text" placeholder="e.g. Dolo 650, Crocin Advance, Paracetamol 500mg" />
+      <input id="searchInput" aria-label="Medicine name and strength" maxlength="120" type="text" placeholder="e.g. Dolo 650, Crocin Advance, Paracetamol 500mg" />
       <button id="searchBtn" onclick="runSearch()">Search</button>
     </div>
     <div class="hint-chips">
@@ -71,14 +71,14 @@
       <span class="chip" onclick="quickSearch('Paracetamol 500mg')">Paracetamol 500mg</span>
       <span class="chip" onclick="quickSearch('Cetrizine 10mg')">Cetrizine 10mg</span>
     </div>
-    <p id="status"></p>
+    <p id="status" role="status" aria-live="polite"></p>
   </div>
 </header>
 
 <main>
   <div id="results"></div>
   <div class="disclaimer">
-    Price comparison only — not a pharmacy. Prescription (Rx) medicines require uploading a valid prescription on the pharmacy's own site to complete any order. Prices are indicative and can change after you click through. Apollo 24/7 and Truemeds aren't included (their APIs aren't openly reachable — see PLATFORM_STATUS.md).
+    Price comparison only — not a pharmacy. Prescription (Rx) medicines require uploading a valid prescription on the pharmacy's own site to complete any order. Prices are indicative and can change after you click through. Listed prices exclude delivery fees and personalised discounts. Location-specific stock is not verified; 1mg currently uses Pune. Check the exact medicine, strength and pack size on the pharmacy before ordering. Never substitute medicines based on price alone.
   </div>
 </main>
 
@@ -86,6 +86,12 @@
 
 <script>
 const API = "/api/compare";
+let searchVersion = 0;
+function escapeHTML(value){
+  const node = document.createElement("span");
+  node.textContent = String(value ?? "");
+  return node.innerHTML;
+}
 
 function quickSearch(q){
   document.getElementById("searchInput").value = q;
@@ -97,7 +103,8 @@ async function runSearch(){
   const status = document.getElementById("status");
   const results = document.getElementById("results");
   const btn = document.getElementById("searchBtn");
-  if(!q){ return; }
+  if(q.length < 2){ status.textContent = "Enter at least two characters."; return; }
+  const version = ++searchVersion;
 
   btn.disabled = true;
   status.textContent = "Searching live prices — this can take a few seconds...";
@@ -107,12 +114,13 @@ async function runSearch(){
     const resp = await fetch(API + "?q=" + encodeURIComponent(q));
     if(!resp.ok) throw new Error("Request failed (" + resp.status + ")");
     const data = await resp.json();
+    if(version !== searchVersion) return;
     render(data);
     status.textContent = "";
   }catch(err){
-    status.textContent = "Something went wrong: " + err.message;
+    if(version === searchVersion) status.textContent = "Something went wrong: " + err.message;
   }finally{
-    btn.disabled = false;
+    if(version === searchVersion) btn.disabled = false;
   }
 }
 
@@ -120,8 +128,19 @@ function render(data){
   const results = document.getElementById("results");
   results.innerHTML = "";
 
+  for(const [platform, bucket] of Object.entries(data.platforms || {})){
+    if(bucket.error){
+      const warning = document.createElement("p");
+      warning.className = "panel";
+      warning.textContent = platform + ": " + bucket.error;
+      results.appendChild(warning);
+    }
+  }
   if(!data.reference){
-    results.innerHTML = '<div class="panel"><p class="empty">No results found on 1mg for that search — try a different spelling or a more common name.</p></div>';
+    const empty = document.createElement("p");
+    empty.className = "panel empty";
+    empty.textContent = "No listings returned from available providers. Try a more specific medicine name.";
+    results.appendChild(empty);
     return;
   }
 
@@ -145,13 +164,26 @@ function render(data){
       card.className = "result-card" + (isBest ? " best" : "");
       card.innerHTML = `
         <div class="result-top">
-          <span class="plat-name">${platform}</span>
+          <span class="plat-name">${escapeHTML(platform)}</span>
           ${isBest ? '<span class="best-badge">Best price</span>' : ''}
         </div>
-        <div class="result-title">${item.title}${item.rx_required ? '<span class="rx-badge">Rx</span>' : ''}</div>
+        <div class="result-title">${escapeHTML(item.title)}${item.rx_required ? '<span class="rx-badge">Rx</span>' : ''}</div>
         <div class="result-price">${item.price != null ? "₹" + item.price.toFixed(2) : "Price unavailable"}</div>
         <div class="result-meta">${item.in_stock ? '<span class="stock-in">In stock</span>' : '<span class="stock-out">Out of stock</span>'}</div>
       `;
+      if(item.product_url){
+        try{
+          const url = new URL(item.product_url);
+          if(url.protocol === "https:" && ["www.1mg.com", "pharmeasy.in", "www.netmeds.com"].includes(url.hostname)){
+            const link = document.createElement("a");
+            link.href = url.href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "View on pharmacy";
+            card.appendChild(link);
+          }
+        }catch{}
+      }
       panel.appendChild(card);
     }
   }
@@ -159,10 +191,14 @@ function render(data){
   if(!anyMatches){
     const none = document.createElement("p");
     none.className = "empty";
-    none.textContent = "Found results on 1mg, but nothing on the other platforms matched confidently enough to call it the same medicine. See below for everything found.";
+    none.textContent = "Listings were found, but their brand, strength, pack size and form could not be matched confidently. Review the other results below.";
     panel.appendChild(none);
   }
 
+  const freshness = document.createElement("p");
+  freshness.textContent = "Prices checked: " + new Date(data.checked_at * 1000).toLocaleString();
+  freshness.className = "result-meta";
+  panel.appendChild(freshness);
   results.appendChild(panel);
 
   // Secondary section: unmatched results per platform, in case the real
